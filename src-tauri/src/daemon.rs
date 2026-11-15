@@ -11,12 +11,41 @@ use std::path::PathBuf;
 
 pub const PROTOCOL_VERSION: u64 = 1;
 
-pub fn socket_path() -> PathBuf {
-    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
-        PathBuf::from(runtime).join("kensaku.sock")
-    } else {
-        KensakuConfig::config_dir().join("kensaku.sock")
+/// Unix socket paths to try, most specific first.
+///
+/// The daemon listens on `$XDG_RUNTIME_DIR/kensaku.sock` when that variable is
+/// set, otherwise under the config dir. A systemd *system* unit does not always
+/// export `XDG_RUNTIME_DIR`, while an interactive shell does, so the two sides
+/// used to disagree about where the socket was even when both were healthy:
+/// the CLI decided no daemon was running and opened the index directly.
+/// Connecting to each candidate in turn costs nothing and makes the transport
+/// independent of which context each process was started from.
+fn socket_candidates(
+    runtime: Option<&std::path::Path>,
+    config_dir: &std::path::Path,
+) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(runtime) = runtime {
+        paths.push(runtime.join("kensaku.sock"));
     }
+    let fallback = config_dir.join("kensaku.sock");
+    if !paths.contains(&fallback) {
+        paths.push(fallback);
+    }
+    paths
+}
+
+pub fn socket_paths() -> Vec<PathBuf> {
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    socket_candidates(runtime.as_deref(), &KensakuConfig::config_dir())
+}
+
+/// The preferred socket path (see [`socket_paths`]).
+pub fn socket_path() -> PathBuf {
+    socket_paths()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| KensakuConfig::config_dir().join("kensaku.sock"))
 }
 
 pub fn token_path() -> PathBuf {
@@ -30,18 +59,6 @@ pub fn read_token() -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
-#[cfg(unix)]
-fn socket_name() -> std::io::Result<interprocess::local_socket::Name<'static>> {
-    use interprocess::local_socket::{GenericFilePath, ToFsName};
-    socket_path().to_fs_name::<GenericFilePath>()
-}
-
-#[cfg(windows)]
-fn socket_name() -> std::io::Result<interprocess::local_socket::Name<'static>> {
-    use interprocess::local_socket::{GenericNamespaced, ToNsName};
-    "kensaku".to_ns_name::<GenericNamespaced>()
-}
-
 pub fn request(method: &str, mut params: Value) -> Result<Value, String> {
     use interprocess::local_socket::prelude::*;
     use std::io::{BufRead, BufReader, Write};
@@ -51,9 +68,40 @@ pub fn request(method: &str, mut params: Value) -> Result<Value, String> {
         return Err("daemon disabled by KENSAKU_NO_DAEMON".to_string());
     }
     let token = read_token().ok_or_else(|| "daemon token missing".to_string())?;
-    let name = socket_name().map_err(|e| format!("daemon socket name: {}", e))?;
-    let stream =
-        LocalSocketStream::connect(name).map_err(|e| format!("daemon unavailable: {}", e))?;
+    let mut stream = None;
+    let mut last_error = String::from("no candidate socket");
+    for path in socket_paths() {
+        #[cfg(unix)]
+        let name = {
+            use interprocess::local_socket::{GenericFilePath, ToFsName};
+            match path.clone().to_fs_name::<GenericFilePath>() {
+                Ok(name) => name,
+                Err(e) => {
+                    last_error = format!("daemon socket name: {}", e);
+                    continue;
+                }
+            }
+        };
+        #[cfg(windows)]
+        let name = {
+            use interprocess::local_socket::{GenericNamespaced, ToNsName};
+            match "kensaku".to_ns_name::<GenericNamespaced>() {
+                Ok(name) => name,
+                Err(e) => {
+                    last_error = format!("daemon socket name: {}", e);
+                    continue;
+                }
+            }
+        };
+        match LocalSocketStream::connect(name) {
+            Ok(connected) => {
+                stream = Some(connected);
+                break;
+            }
+            Err(e) => last_error = format!("daemon unavailable at {}: {}", path.display(), e),
+        }
+    }
+    let stream = stream.ok_or(last_error)?;
     stream
         .set_recv_timeout(Some(Duration::from_secs(30)))
         .map_err(|e| e.to_string())?;
@@ -124,6 +172,25 @@ mod tests {
     #[test]
     fn accepts_matching_handshake() {
         assert!(authenticate("good", Some("good"), Some(PROTOCOL_VERSION)).is_ok());
+    }
+
+    #[test]
+    fn socket_candidates_prefer_runtime_and_fall_back_to_config_dir() {
+        let runtime = PathBuf::from("/run/user/1000");
+        let config = PathBuf::from("/home/u/.config/kensaku");
+        assert_eq!(
+            socket_candidates(Some(&runtime), &config),
+            vec![runtime.join("kensaku.sock"), config.join("kensaku.sock")]
+        );
+        assert_eq!(
+            socket_candidates(None, &config),
+            vec![config.join("kensaku.sock")]
+        );
+        // When both resolve to the same directory the path is tried once.
+        assert_eq!(
+            socket_candidates(Some(&config), &config),
+            vec![config.join("kensaku.sock")]
+        );
     }
 }
 
