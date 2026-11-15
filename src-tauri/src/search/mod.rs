@@ -1165,13 +1165,25 @@ impl SearchDispatcher {
         // Weak vectors are kept in the map (with their raw cosine) so hits that
         // also match fuzzy/BM25 still contribute; the floor below is applied
         // only when creating a semantic-only candidate.
+        //
+        // Measured on a 461-chunk corpus (#177): random letters scored up to
+        // 0.56 against unrelated source files and 25-50% of chunks cleared the
+        // old 0.28 floor, while a word the corpus does not contain
+        // ("kubernetes") produced 0.31-0.33 junk with no true hit. Two things
+        // caused it: an absolute floor cannot separate a compressed similarity
+        // band at corpus scale, and the table can only spell some queries out
+        // one letter at a time. So the query's tokenization decides whether the
+        // tier runs, the floor sits in the measured gap, and only a handful of
+        // semantic-only results are admitted.
         let model = ModelRegistry::global();
-        let semantic_floor = if model.has_static_table() { 0.28 } else { 0.12 };
+        let semantic_query_usable = semantic_query_is_usable(&model, search_text);
+        let semantic_floor = semantic_only_floor(&model);
         let mut semantic_ranks: HashMap<PathBuf, (usize, f32, (usize, usize))> = HashMap::new();
         if semantic_enabled
             && model.is_enabled()
             && !search_text.is_empty()
             && !has_near
+            && semantic_query_usable
             && let Some(store) = unit_store
             && !store.is_empty()
         {
@@ -1251,6 +1263,27 @@ impl SearchDispatcher {
         }
 
         // 6. 4-tier RRF Fusion (k = 60.0) with dynamic route weights
+        //
+        // Semantic-only candidates are the strongest few that clear the model's
+        // floor. Choosing them here, rather than inside the merge loop, makes
+        // the subset deterministic (ties break on path) and bounded: on a large
+        // index a few hundred units can clear any absolute floor, and a long
+        // "vaguely related" tail is what buried the real hits in #177. Files
+        // already found by a lexical tier are merged regardless.
+        let semantic_only_allowed: HashSet<PathBuf> = {
+            let mut admitted: Vec<(&PathBuf, f32)> = semantic_ranks
+                .iter()
+                .filter(|(_, (_, cosine, _))| *cosine >= semantic_floor)
+                .map(|(path, (_, cosine, _))| (path, *cosine))
+                .collect();
+            admitted.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+            admitted
+                .into_iter()
+                .take(semantic_only_limit(limit))
+                .map(|(path, _)| path.clone())
+                .collect()
+        };
+
         struct MatchCandidate {
             entry_idx: usize,
             in_fuzzy: bool,
@@ -1341,7 +1374,7 @@ impl SearchDispatcher {
             }
 
             // Merge Semantic matches
-            for (path, &(rank, cosine, range)) in &semantic_ranks {
+            for (path, &(rank, _cosine, range)) in &semantic_ranks {
                 let Some(orig_idx) = resolve_index(path) else {
                     continue;
                 };
@@ -1354,9 +1387,10 @@ impl SearchDispatcher {
                     cand.rrf_score += rrf;
                     cand.best_range = Some(range);
                 } else {
-                    // Semantic-only candidates must clear the relevance floor;
-                    // hits already found by fuzzy/BM25 are merged above.
-                    if cosine < semantic_floor {
+                    // Semantic-only candidates come from the pre-selected,
+                    // bounded set; anything else is a weak hit that has no
+                    // lexical support, which is exactly what the floor is for.
+                    if !semantic_only_allowed.contains(path) {
                         continue;
                     }
                     candidates.insert(
@@ -1583,6 +1617,61 @@ impl SearchDispatcher {
             facets,
         }
     }
+}
+
+/// Whether the active embedding model can rank this query at all.
+///
+/// The shipped static table has single-character pieces for ASCII letters, so a
+/// query it cannot represent — random letters (`kjhdfkhoqiuw`), or a script the
+/// vocabulary lacks — becomes a bag of single letters instead of a meaning. On a
+/// source-heavy corpus such vectors score **0.46-0.56** against unrelated files,
+/// above every floor that still keeps real matches, so no threshold can separate
+/// them. Skipping the tier is the honest answer: the keyword, fuzzy and folded
+/// tiers still run, and a result set that is empty is better than noise.
+///
+/// `None` granularity means the provider has no word-piece vocabulary to ask
+/// (the hashing estimator or the ONNX `smart` model); those keep the tier.
+fn semantic_query_is_usable(model: &ModelRegistry, query: &str) -> bool {
+    /// Below this, the model is spelling the query out instead of reading it.
+    ///
+    /// Measured against the shipped table: words and natural language sit at
+    /// 2.3-6.0 characters per piece (`invoice` 2.33, `kubernetes` 2.5, `photo`
+    /// 5.0), while letter-spelled strings sit at 1.0-1.7 (`kjhdfkhoqiuw` and
+    /// `asdfghjklzxc` 1.71, Cyrillic 1.0). Short technical tokens the vocabulary
+    /// lacks (`ocr` 1.5, `tokio` 1.67, `src-tauri` 1.6) fall below it too; those
+    /// are exact-token searches that the lexical tiers answer.
+    const MIN_CHARS_PER_PIECE: f32 = 2.0;
+    match model.token_granularity(query) {
+        None => true,
+        Some(granularity) => granularity >= MIN_CHARS_PER_PIECE,
+    }
+}
+
+/// Absolute cosine floor for a semantic-only candidate, by provider.
+///
+/// The values come from measuring similarity distributions on a 461-chunk
+/// corpus: the shipped table puts true matches at 0.40+ and unrelated words at
+/// 0.31-0.33; the hashing estimator is a trigram space where random text reaches
+/// ~0.33; a real ONNX embedding model keeps unrelated text near zero. The
+/// previous 0.28/0.12 pair admitted 25-50% of the chunks for a random query.
+fn semantic_only_floor(model: &ModelRegistry) -> f32 {
+    if model.provider_name() == "static" && !model.has_static_table() {
+        0.30
+    } else if model.has_static_table() {
+        0.35
+    } else {
+        0.28
+    }
+}
+
+/// How many semantic-only results one query may add.
+///
+/// A compressed similarity band still has a tail: on a large index a few hundred
+/// units can clear any absolute floor. Bounding the count keeps vaguely related
+/// files from burying the lexical hits (#177) while keeping the strongest
+/// semantic matches.
+fn semantic_only_limit(limit: usize) -> usize {
+    (limit / 10).clamp(1, 5)
 }
 
 /// Final score for a fused candidate.
@@ -2009,6 +2098,72 @@ fn matches_language(lang: &str, ext_opt: Option<&str>) -> bool {
 mod tests {
     use super::*;
     use crate::query::ast::RangeOp;
+
+    #[test]
+    fn semantic_policy_keeps_the_floor_inside_the_measured_gap() {
+        // No model pack installed: the hashing estimator works in a trigram
+        // space where random text reached ~0.33 on a real corpus.
+        let hashing = ModelRegistry::new_static();
+        assert_eq!(semantic_only_floor(&hashing), 0.30);
+        // The hashing estimator has no word-piece vocabulary to ask, so the
+        // tokenization gate must not disable the tier for it.
+        assert!(semantic_query_is_usable(&hashing, "kjhdfkhoqiuw"));
+
+        // Semantic disabled: no vectors exist at all; keep the neutral default.
+        let disabled = ModelRegistry::new_none();
+        assert_eq!(semantic_only_floor(&disabled), 0.28);
+    }
+
+    #[test]
+    fn semantic_only_results_are_bounded() {
+        assert_eq!(semantic_only_limit(0), 1);
+        assert_eq!(semantic_only_limit(10), 1);
+        assert_eq!(semantic_only_limit(50), 5);
+        assert_eq!(semantic_only_limit(5_000), 5);
+    }
+
+    #[test]
+    fn static_table_gate_skips_queries_it_can_only_spell() {
+        use crate::embed::EMBEDDING_DIM;
+        use crate::embed::table::StaticTable;
+
+        // A vocabulary shaped like the shipped table: single-letter pieces for
+        // ASCII letters, so random letters tokenize as a bag of characters
+        // instead of a word. Between them, gibberish outscored real matches on
+        // source-heavy corpora (#177).
+        let mut vocab: Vec<(&str, u32)> = vec![("[PAD]", 0), ("[UNK]", 1), ("invoice", 2)];
+        // Both the word-initial and the continuation form, as in the real
+        // vocabulary: that is what lets a random string become a full bag of
+        // one-character pieces.
+        let letters = ["k", "j", "h", "d", "f", "o", "q", "i", "u", "w"];
+        let continuations = [
+            "##k", "##j", "##h", "##d", "##f", "##o", "##q", "##i", "##u", "##w",
+        ];
+        let mut next_id = 3u32;
+        for (letter, continuation) in letters.iter().zip(continuations) {
+            vocab.push((letter, next_id));
+            next_id += 1;
+            vocab.push((continuation, next_id));
+            next_id += 1;
+        }
+        let table = StaticTable::test_table(vec![0.0; 32 * EMBEDDING_DIM], &vocab, EMBEDDING_DIM);
+        let model = ModelRegistry::with_table_for_test(table);
+
+        assert_eq!(model.token_granularity("kjhdfkhoqiuw"), Some(1.0));
+        assert!(!semantic_query_is_usable(&model, "kjhdfkhoqiuw"));
+
+        // A whole word is one piece, so the tier stays available.
+        assert_eq!(model.token_granularity("invoice"), Some(7.0));
+        assert!(semantic_query_is_usable(&model, "invoice"));
+
+        // A script the vocabulary lacks embeds to zero: there is nothing to rank.
+        assert_eq!(model.token_granularity("東京"), Some(0.0));
+        assert!(!semantic_query_is_usable(&model, "東京"));
+
+        // The table is the provider most vulnerable to the compressed band, so
+        // it gets the highest floor.
+        assert_eq!(semantic_only_floor(&model), 0.35);
+    }
 
     fn fake_result(path: &str) -> SearchResult {
         SearchResult {

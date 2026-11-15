@@ -176,6 +176,27 @@ impl StaticTable {
         ids
     }
 
+    /// Mean characters per WordPiece piece for `text`.
+    ///
+    /// The table has single-character pieces for ASCII letters, so a word it
+    /// cannot represent degrades into a bag of single letters. That is a
+    /// spelling, not a meaning, and such vectors correlate with any
+    /// identifier- or code-heavy document (0.4-0.5 cosine for random letters
+    /// against source files). Callers use this ratio to keep the semantic tier
+    /// away from queries it can only spell out. `0.0` means nothing in the
+    /// text is representable at all.
+    pub fn token_granularity(&self, text: &str) -> f32 {
+        let chars = text.chars().filter(|c| c.is_alphanumeric()).count();
+        if chars == 0 {
+            return 0.0;
+        }
+        let pieces = self.token_ids(text).len();
+        if pieces == 0 {
+            return 0.0;
+        }
+        chars as f32 / pieces as f32
+    }
+
     /// Mean-pools token embedding rows, then L2-normalizes when configured.
     pub fn embed(&self, text: &str) -> Vec<f32> {
         let mut out = vec![0.0f32; self.dim];
@@ -252,6 +273,16 @@ impl StaticTable {
     }
 
     /// Greedy longest-match WordPiece with the `##` continuation prefix.
+    ///
+    /// A word with no known pieces contributes **no** ids. Mapping it to
+    /// `[UNK]` instead gives every unrepresentable word the same embedding row,
+    /// which turns the vector space into a `[UNK]` magnet: a query made of
+    /// random letters (or any script the vocabulary lacks) becomes the `[UNK]`
+    /// row itself, and every document with identifiers, hashes or non-English
+    /// words accumulates the same row. Unrelated files then score 0.3-0.6
+    /// cosine against a gibberish query. Dropping the word keeps the vector a
+    /// mean of what the model actually understands; a query nothing is known
+    /// about embeds to zero and scores nothing, which is the honest answer.
     fn tokenize_word(&self, word: &str, ids: &mut Vec<u32>) {
         if word.is_empty() {
             return;
@@ -265,7 +296,6 @@ impl StaticTable {
 
         let chars: Vec<char> = word.chars().collect();
         if chars.len() > self.max_input_chars {
-            ids.push(self.unknown_id);
             return;
         }
 
@@ -292,8 +322,8 @@ impl StaticTable {
                     start = end;
                 }
                 None => {
-                    // A single unmatched character invalidates the whole word.
-                    ids.push(self.unknown_id);
+                    // A single unmatched character invalidates the whole word;
+                    // it contributes no embedding row (see the doc comment).
                     return;
                 }
             }
@@ -302,7 +332,7 @@ impl StaticTable {
     }
 
     #[cfg(test)]
-    fn test_table(embeddings: Vec<f32>, vocab: &[(&str, u32)], dim: usize) -> Self {
+    pub(crate) fn test_table(embeddings: Vec<f32>, vocab: &[(&str, u32)], dim: usize) -> Self {
         let (embeddings_i8, embedding_scales) = quantize(&embeddings, dim);
         Self {
             embeddings: Vec::new(),
@@ -320,7 +350,7 @@ impl StaticTable {
     }
 
     #[cfg(test)]
-    fn test_table_f32(embeddings: Vec<f32>, vocab: &[(&str, u32)], dim: usize) -> Self {
+    pub(crate) fn test_table_f32(embeddings: Vec<f32>, vocab: &[(&str, u32)], dim: usize) -> Self {
         Self {
             embeddings,
             embeddings_i8: Vec::new(),
@@ -739,10 +769,43 @@ mod tests {
         assert_eq!(table.token_ids("hello world"), vec![2, 3]);
         assert_eq!(table.token_ids("playing"), vec![5, 4]);
         assert_eq!(table.token_ids("played"), vec![5, 6]);
-        assert_eq!(table.token_ids("zzz"), vec![1]);
-        assert_eq!(table.token_ids("hello zzz world"), vec![2, 1, 3]);
-        // Lowercased before lookup, punctuation isolated, whitespace collapsed.
-        assert_eq!(table.token_ids("  Hello,\tWORLD!  "), vec![2, 1, 3, 1]);
+        // Unrepresentable words contribute nothing: mapping them to `[UNK]`
+        // made every garbage query and every identifier-heavy document share
+        // one embedding row, so gibberish scored 0.3-0.6 against unrelated
+        // files (#177).
+        assert!(table.token_ids("zzz").is_empty());
+        assert!(table.token_ids("kjhdfkhoqiuw").is_empty());
+        assert_eq!(table.token_ids("hello zzz world"), vec![2, 3]);
+        // Lowercased before lookup; unknown punctuation is dropped with the
+        // word it is attached to, and whitespace is collapsed.
+        assert_eq!(table.token_ids("  Hello,\tWORLD!  "), vec![2, 3]);
+    }
+
+    #[test]
+    fn unrepresentable_text_embeds_to_zero_instead_of_the_unknown_row() {
+        let mut embeddings = vec![0.0f32; 8 * EMBEDDING_DIM];
+        // Both the `[UNK]` row and the `hello` row are non-zero, so the test can
+        // tell "produced the [UNK] row" apart from "produced nothing".
+        for row in [1usize, 2] {
+            for v in &mut embeddings[row * EMBEDDING_DIM..(row + 1) * EMBEDDING_DIM] {
+                *v = 0.5;
+            }
+        }
+        let table = StaticTable::test_table(
+            embeddings,
+            &[("[PAD]", 0), ("[UNK]", 1), ("hello", 2)],
+            EMBEDDING_DIM,
+        );
+
+        let garbage = table.embed("kjhdfkhoqiuw");
+        assert!(
+            garbage.iter().all(|v| *v == 0.0),
+            "a query the vocabulary cannot represent must not become the [UNK] row"
+        );
+        // The [UNK] row is still part of the matrix; it is just never produced
+        // by an unmatched word, so nothing can cluster on it.
+        assert_eq!(table.unknown_id, 1);
+        assert!(table.embed("hello").iter().any(|v| *v != 0.0));
     }
 
     #[test]

@@ -221,6 +221,24 @@ mod tests {
     }
 
     #[test]
+    fn gibberish_query_does_not_match_fixture_file_names() {
+        // #177 was reported as filename noise, and fuzzy is the tier that runs
+        // before the semantic one. A random-letter query must not match names.
+        let entries = fixture();
+        let candidates: Vec<usize> = (0..entries.len()).collect();
+        let mut searcher = FuzzySearcher::new();
+        let results = searcher.search("kjhdfkhoqiuw", &entries, &candidates, 50);
+        assert!(
+            results.is_empty(),
+            "gibberish matched file names: {:?}",
+            results
+                .iter()
+                .map(|(i, s)| (&entries[*i].path, *s))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn char_bloom_prefilter_keeps_valid_matches() {
         let entries = fixture();
         let candidates: Vec<usize> = (0..entries.len()).collect();

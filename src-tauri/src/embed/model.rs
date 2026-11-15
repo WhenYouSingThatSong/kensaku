@@ -96,6 +96,18 @@ impl ModelRegistry {
         }
     }
 
+    /// Registry backed by an in-memory table, so tests can exercise the
+    /// table-specific behavior without the downloaded model artifacts.
+    #[cfg(test)]
+    pub(crate) fn with_table_for_test(table: crate::embed::table::StaticTable) -> Self {
+        let mut registry = Self::new_static();
+        registry.name = "static-table-test".to_string();
+        registry.model_id = table.model_id;
+        registry.dim = table.dim;
+        registry.table = Some(Arc::new(table));
+        registry
+    }
+
     /// Loads the real static table from `dir` (the downloaded model directory).
     ///
     /// Returns `None` when the artifacts are missing/corrupt or the embedding
@@ -277,6 +289,19 @@ impl ModelRegistry {
     /// True when real model weights back this registry.
     pub fn has_static_table(&self) -> bool {
         self.table.is_some()
+    }
+
+    /// Mean characters per WordPiece piece for `text`, or `None` when the
+    /// active provider has no word-piece vocabulary to ask (the hashing
+    /// estimator and the ONNX `smart` model).
+    ///
+    /// Used to keep the semantic tier away from queries the static table can
+    /// only spell out one character at a time; see
+    /// [`crate::embed::table::StaticTable::token_granularity`].
+    pub fn token_granularity(&self, text: &str) -> Option<f32> {
+        self.table
+            .as_ref()
+            .map(|table| table.token_granularity(text))
     }
 
     /// Tokenizes input text into normalized terms and character 3-grams for subword coverage.
