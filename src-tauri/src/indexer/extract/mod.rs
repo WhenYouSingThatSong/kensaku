@@ -438,7 +438,7 @@ fn extraction_timeout_for(file_size: u64, is_ocr_candidate: bool) -> Duration {
 const SLOT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Number of concurrent extractions (and therefore concurrent OCR processes).
-fn extraction_concurrency() -> usize {
+pub(crate) fn extraction_concurrency() -> usize {
     extraction_concurrency_for(
         std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
     )

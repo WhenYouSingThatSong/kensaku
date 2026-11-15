@@ -272,6 +272,62 @@ fn start_phash_backfill(
     });
 }
 
+/// Releases the crawl gate and resets the visible status if the crawl panics.
+///
+/// A panic anywhere in a crawl (an extractor, a rayon scope, an embedding
+/// call) used to leave the gate set for the rest of the process lifetime:
+/// every later crawl and rebuild returned immediately, the index never
+/// updated again, and nothing was logged. The gate half is fixed here; the
+/// status half matters just as much, because the phase is written before the
+/// long-running work starts. Without the reset, a panic leaves the GUI and the
+/// daemon `health` RPC reporting `extracting` at 0/N forever with no thread
+/// behind it. The normal path releases both explicitly and disarms the guard.
+struct CrawlGateGuard {
+    gate: Arc<AtomicBool>,
+    status: Arc<RwLock<IndexingStatus>>,
+    app_handle: Arc<RwLock<Option<tauri::AppHandle>>>,
+    armed: bool,
+}
+
+impl CrawlGateGuard {
+    fn new(
+        gate: Arc<AtomicBool>,
+        status: Arc<RwLock<IndexingStatus>>,
+        app_handle: Arc<RwLock<Option<tauri::AppHandle>>>,
+    ) -> Self {
+        Self {
+            gate,
+            status,
+            app_handle,
+            armed: true,
+        }
+    }
+}
+
+impl Drop for CrawlGateGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.gate.store(false, Ordering::SeqCst);
+        if !thread::panicking() {
+            return;
+        }
+        // `parking_lot::RwLock` does not poison, so this cannot panic inside
+        // an unwinding thread (which would abort the process).
+        let mut st = self.status.write();
+        st.is_indexing = false;
+        st.paused = false;
+        st.phase = "idle".to_string();
+        st.extract_done = 0;
+        st.extract_total = 0;
+        st.current_status = "Indexing stopped unexpectedly — see logs, then retry.".to_string();
+        IndexerManager::emit_status(&self.app_handle, &st);
+        drop(st);
+        crate::say!("[Kensaku Indexer] crawl aborted by a panic; status reset to idle");
+    }
+}
+
 pub struct IndexerManager {
     pub metadata: Arc<RwLock<MetadataStore>>,
     pub content_index: Arc<RwLock<Option<ContentIndex>>>,
@@ -634,27 +690,11 @@ impl IndexerManager {
         let watcher_ok = Arc::clone(&self.watcher_ok);
 
         thread::spawn(move || {
-            // A panic anywhere in the crawl (an extractor, a rayon scope, an
-            // embedding call) used to leave the gate set for the rest of the
-            // process lifetime: every later crawl and rebuild returned
-            // immediately and the index never updated again, with no error
-            // shown. The guard hands the gate back on unwind; the normal path
-            // releases it explicitly and disarms this.
-            struct GateGuard {
-                gate: Arc<std::sync::atomic::AtomicBool>,
-                armed: bool,
-            }
-            impl Drop for GateGuard {
-                fn drop(&mut self) {
-                    if self.armed {
-                        self.gate.store(false, Ordering::SeqCst);
-                    }
-                }
-            }
-            let mut gate_guard = GateGuard {
-                gate: Arc::clone(&is_running),
-                armed: true,
-            };
+            let mut gate_guard = CrawlGateGuard::new(
+                Arc::clone(&is_running),
+                Arc::clone(&status),
+                Arc::clone(&app_handle),
+            );
 
             // Apply OCR engine selection and record whether it re-queued
             // images: that is one of the reasons a crawl re-reads files, and
@@ -888,6 +928,17 @@ impl IndexerManager {
                 quiet = false;
             }
             if !quiet {
+                // Log the dispatch parameters once. "extracting, 0/N, 0% CPU"
+                // is ambiguous between "never dispatched" and "worker blocked",
+                // and the two need different fixes.
+                crate::say!(
+                    "[Kensaku Indexer] extraction: {} file(s) queued, {} worker(s), {} CPU(s) available",
+                    extract_total,
+                    crate::indexer::extract::extraction_concurrency(),
+                    std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(0)
+                );
                 let mut st = status.write();
                 st.is_indexing = true;
                 st.phase = "extracting".to_string();
@@ -951,10 +1002,19 @@ impl IndexerManager {
             let pace_gate = Arc::new(Mutex::new(Instant::now()));
             let producer_query_flag = Arc::clone(&query_in_flight);
 
-            rayon::scope(|scope| {
+            // The producer must NOT run as a `rayon::scope` task here. With a
+            // one-thread global pool (a cgroup `CPUQuota=100%`, a single-core
+            // box, `RAYON_NUM_THREADS=1`) `scope` executes its body on the only
+            // worker: the consumer below blocks on `rx`, so the spawned
+            // producer is still queued on that same worker and never runs.
+            // That is the headless-daemon stall: phase "extracting" at 0/N,
+            // zero CPU, forever. A plain scoped thread keeps one thread for
+            // the producer and one for the consumer regardless of pool size;
+            // the parallel extraction inside still uses the global pool.
+            std::thread::scope(|scope| {
                 use rayon::prelude::*;
 
-                scope.spawn(move |_| {
+                scope.spawn(move || {
                     to_extract.par_iter().for_each_with(tx, |tx, job| {
                         Self::wait_while_paused(&producer_config, &producer_status, &producer_app);
                         // Search comes first: a user waiting on results must not
@@ -1015,7 +1075,11 @@ impl IndexerManager {
                         };
 
                         let done = extract_done.fetch_add(1, Ordering::Relaxed) + 1;
-                        if done.is_multiple_of(5) || done == extract_total {
+                        // Report the first completion too: with fewer than five
+                        // files the old condition kept the UI and the daemon
+                        // `health` RPC at "0/N" until the whole batch finished,
+                        // which reads as a stall even when extraction is fine.
+                        if done == 1 || done.is_multiple_of(5) || done == extract_total {
                             let mut st = producer_status.write();
                             st.extract_done = done;
                             st.current_status =
@@ -2591,5 +2655,78 @@ mod tests {
         assert!(results[0].similarity >= 0.99);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    fn crawling_status() -> IndexingStatus {
+        IndexingStatus {
+            is_indexing: true,
+            files_indexed: 12,
+            content_indexed: 0,
+            current_status: "Extracting text… 0/3 files".to_string(),
+            is_embedding: false,
+            units_indexed: 0,
+            semantic_ready: false,
+            phase: "extracting".to_string(),
+            total_files: 3,
+            extract_done: 0,
+            extract_total: 3,
+            paused: false,
+        }
+    }
+
+    #[test]
+    fn panicking_crawl_releases_the_gate_and_clears_the_phase() {
+        // Regression for the headless-daemon report: a crawl that panics used
+        // to release the gate but leave `phase = "extracting"` at 0/N, so
+        // `health` and the GUI showed a crawl that no thread was running.
+        let gate = Arc::new(AtomicBool::new(true));
+        let status = Arc::new(RwLock::new(crawling_status()));
+        let handle = Arc::new(RwLock::new(None));
+
+        let (gate_in, status_in, handle_in) =
+            (Arc::clone(&gate), Arc::clone(&status), Arc::clone(&handle));
+        let crawl = thread::spawn(move || {
+            let _guard = CrawlGateGuard::new(gate_in, status_in, handle_in);
+            panic!("simulated extractor panic");
+        });
+        assert!(crawl.join().is_err(), "the simulated crawl must panic");
+
+        assert!(!gate.load(Ordering::SeqCst), "gate must be released");
+        let st = status.read();
+        assert!(!st.is_indexing);
+        assert_eq!(st.phase, "idle");
+        assert_eq!(st.extract_total, 0);
+        assert_eq!(st.extract_done, 0);
+        assert!(st.current_status.contains("stopped unexpectedly"));
+    }
+
+    #[test]
+    fn completed_crawl_keeps_the_status_it_set() {
+        let gate = Arc::new(AtomicBool::new(true));
+        let status = Arc::new(RwLock::new(crawling_status()));
+        let handle = Arc::new(RwLock::new(None));
+        let status_in = Arc::clone(&status);
+
+        let crawl = thread::spawn(move || {
+            let mut guard = CrawlGateGuard::new(gate, status_in, handle);
+            {
+                let mut st = guard.status.write();
+                st.is_indexing = false;
+                st.phase = "idle".to_string();
+                st.current_status = "Ready (3 files indexed)".to_string();
+            }
+            gate_for_normal_path(&mut guard);
+        });
+        crawl.join().expect("a clean crawl must not panic");
+
+        let st = status.read();
+        assert_eq!(st.current_status, "Ready (3 files indexed)");
+        assert_eq!(st.phase, "idle");
+    }
+
+    /// Mirrors the normal completion path: release the gate, then disarm.
+    fn gate_for_normal_path(guard: &mut CrawlGateGuard) {
+        guard.gate.store(false, Ordering::SeqCst);
+        guard.armed = false;
     }
 }
