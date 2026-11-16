@@ -44,3 +44,6 @@ strip = true
 
 [features]
 quick-ui = ["dep:eframe"]
+# Opt into the ONNX smart embedding pack (bge-small-en-v1.5 int8) from the
+# library crate; without it `semantic_model: "smart"` falls back to static.
+smart-embeddings = ["kensaku/smart-embeddings"]

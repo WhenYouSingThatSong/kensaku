@@ -190,6 +190,7 @@ impl ModelRegistry {
                             "Smart ONNX artifacts missing or invalid in {}; falling back to static provider",
                             smart_dir.display()
                         );
+                        eprintln!("[Kensaku embed] {fallback_reason}");
                         let mut reg =
                             Self::load_with_f32(dir, config.semantic_f32_table).unwrap_or_default();
                         reg.fallback_reason = Some(fallback_reason);

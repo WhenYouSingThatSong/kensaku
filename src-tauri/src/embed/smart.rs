@@ -62,6 +62,13 @@ impl SmartEmbedder {
         let config_path = dir.join("config.json");
 
         if !model_path.is_file() || !tokenizer_path.is_file() {
+            eprintln!(
+                "[Kensaku embed] smart pack incomplete in {} (model={} tokenizer={} config={})",
+                dir.display(),
+                model_path.is_file(),
+                tokenizer_path.is_file(),
+                config_path.is_file()
+            );
             return None;
         }
 
@@ -82,16 +89,60 @@ impl SmartEmbedder {
             Err(_) => 384,
         };
 
-        static ENVIRONMENT: Mutex<Option<ort::environment::Environment>> = Mutex::new(None);
-        let session = {
+        // ORT allows a single environment per process. With the OCR feature
+        // compiled in, PP-OCR/Indra already own that environment through the
+        // vendored `paddleocr_rs_onnx`, so reuse it instead of building a
+        // second one (which fails with "only one environment is allowed per
+        // process" and silently disables OCR).
+        #[cfg(feature = "accurate-ocr")]
+        let environment = match paddleocr_rs_onnx::shared_environment() {
+            Ok(environment) => environment,
+            Err(error) => {
+                eprintln!("[Kensaku embed] ONNX environment unavailable: {error}");
+                return None;
+            }
+        };
+        #[cfg(not(feature = "accurate-ocr"))]
+        let environment = {
+            static ENVIRONMENT: Mutex<Option<ort::environment::Environment>> = Mutex::new(None);
             let mut env = ENVIRONMENT.lock();
             if env.is_none() {
-                *env = Some(ort::init().build().ok()?);
+                match ort::init().build() {
+                    Ok(created) => *env = Some(created),
+                    Err(error) => {
+                        eprintln!("[Kensaku embed] ONNX environment unavailable: {error}");
+                        return None;
+                    }
+                }
             }
-            let builder = ort::session::Session::builder(env.as_ref().unwrap()).ok()?;
+            env.as_ref().unwrap().clone()
+        };
+        let session = {
+            let builder = match ort::session::Session::builder(&environment) {
+                Ok(builder) => builder,
+                Err(error) => {
+                    eprintln!("[Kensaku embed] session builder failed: {error}");
+                    return None;
+                }
+            };
             // Bound intra-op threads to 1 to stay within background budget
-            let mut builder = builder.with_intra_threads(1).ok()?;
-            builder.commit_from_file(&model_path).ok()?
+            let mut builder = match builder.with_intra_threads(1) {
+                Ok(builder) => builder,
+                Err(error) => {
+                    eprintln!("[Kensaku embed] intra-op thread limit failed: {error}");
+                    return None;
+                }
+            };
+            match builder.commit_from_file(&model_path) {
+                Ok(session) => session,
+                Err(error) => {
+                    eprintln!(
+                        "[Kensaku embed] could not load {}: {error}",
+                        model_path.display()
+                    );
+                    return None;
+                }
+            }
         };
 
         let has_token_types = session
