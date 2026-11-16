@@ -21,7 +21,9 @@ use super::DocumentExtract;
 /// timeout is always handled by this module before its worker is detached.
 const MAX_TIMEOUT_MS: u64 = 7_000;
 const MIN_TIMEOUT_MS: u64 = 100;
-const MAX_OUTPUT_BYTES: u64 = 4 * 1024 * 1024;
+/// Upper bound for captured stdout. 32 MiB keeps long agent-session transcripts
+/// (JSONL, up to ~30 MB decompressed) fully searchable; the default stays 1 MB.
+const MAX_OUTPUT_BYTES: u64 = 32 * 1024 * 1024;
 
 static REGISTRY: OnceLock<RwLock<Vec<ExternalExtractor>>> = OnceLock::new();
 static FAILURES: OnceLock<Mutex<VecDeque<(PathBuf, String)>>> = OnceLock::new();

@@ -41,7 +41,7 @@ pub struct ExternalExtractor {
     /// Wall-clock limit; clamped to 100..=7000 ms by the runner.
     #[serde(default = "default_extractor_timeout_ms")]
     pub timeout_ms: u64,
-    /// Maximum captured stdout; clamped to 1 KiB..=4 MiB.
+    /// Maximum captured stdout; clamped to 1 KiB..=32 MiB.
     #[serde(default = "default_extractor_output_bytes")]
     pub max_output_bytes: u64,
     /// External commands never run unless this is explicitly true.
